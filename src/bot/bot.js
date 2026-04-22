@@ -81,6 +81,7 @@ export const setupBot = (token) => {
     ctx.session.address = address;
     ctx.session.mcThreshold = ctx.session.mcThreshold || 5;
     ctx.session.volThreshold = ctx.session.volThreshold || 10;
+    ctx.session.isLiveTracking = ctx.session.isLiveTracking ?? false;
     ctx.session.step = 'configuring';
 
     const card = `💎 *TOKEN IDENTIFIED* 💎\n\n` +
@@ -93,10 +94,12 @@ export const setupBot = (token) => {
       `--------------------------\n` +
       `*Current Config:*\n` +
       `📈 MC Threshold: *${ctx.session.mcThreshold}%*\n` +
-      `🔊 Vol Threshold: *${ctx.session.volThreshold}%*\n`;
+      `🔊 Vol Threshold: *${ctx.session.volThreshold}%*\n` +
+      `🔥 Live Tracking: *${ctx.session.isLiveTracking ? 'ENABLED ✅' : 'DISABLED ❌'}*\n`;
 
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('📈 Set MC Threshold', 'set_mc_btn'), Markup.button.callback('🔊 Set Vol Threshold', 'set_vol_btn')],
+      [Markup.button.callback(ctx.session.isLiveTracking ? '⏸ Disable Live Update' : '🔥 Enable Live Update', 'toggle_live_init')],
       [Markup.button.callback('✅ Confirm & Start Monitoring', 'confirm_cfg')],
       [Markup.button.callback('🗑 Dismiss', 'dismiss')]
     ]);
@@ -180,7 +183,8 @@ export const setupBot = (token) => {
         `📡 *Scan Interval:* ${stats.globalIntervalMs / 1000}s\n` +
         `⏳ *Check Delay:* ${stats.tokenDelayMs}ms\n` +
         `❄️ *Default Cooldown:* ${stats.globalCooldownMs / 60000}m\n` +
-        `🎯 *Alert Logic:* ${stats.alertStrategy === 'both' ? 'BOTH met' : 'EITHER met'}\n\n` +
+        `🎯 *Alert Logic:* ${stats.alertStrategy === 'both' ? 'BOTH met' : 'EITHER met'}\n` +
+        `📈 *Live track %:* ${stats.liveTrackThreshold || 10}%\n\n` +
         `Use buttons below to update global settings:`;
 
       const keyboard = Markup.inlineKeyboard([
@@ -189,6 +193,7 @@ export const setupBot = (token) => {
         [Markup.button.callback('💎 MC Only', 'cfg_strat:mcap'), Markup.button.callback('📊 Vol Only', 'cfg_strat:volume')],
         [Markup.button.callback('🤝 Both Met', 'cfg_strat:both'), Markup.button.callback('🍭 Either Met', 'cfg_strat:any')],
         [Markup.button.callback('❄️ 1m CD', 'cfg_cd:60000'), Markup.button.callback('❄️ 3m CD', 'cfg_cd:180000'), Markup.button.callback('❄️ 10m CD', 'cfg_cd:600000')],
+        [Markup.button.callback('📈 Set Live Track %', 'cfg_live_th')],
         [Markup.button.callback('🗑 Dismiss', 'dismiss')]
       ]);
 
@@ -240,6 +245,19 @@ export const setupBot = (token) => {
       await setupConfigurator(ctx, state.chain, state.address);
       return;
     }
+
+    if (state.step === 'awaiting_live_th') {
+      const val = parseFloat(ctx.message.text);
+      if (isNaN(val)) return ctx.reply('Invalid number. Please enter a percentage:');
+      try {
+        await Stats.findOneAndUpdate({}, { liveTrackThreshold: val }, { upsert: true });
+        ctx.session = null;
+        ctx.reply(`✅ *Success:* Live Tracking threshold changed to *${val}%*`, { parse_mode: 'Markdown' });
+      } catch (err) {
+        ctx.reply('Error updating threshold: ' + err.message);
+      }
+      return;
+    }
   });
 
   bot.on('callback_query', async (ctx) => {
@@ -267,7 +285,7 @@ export const setupBot = (token) => {
     }
 
     if (data === 'confirm_cfg') {
-      const { chain, address, mcThreshold, volThreshold, tokenData } = ctx.session;
+      const { chain, address, mcThreshold, volThreshold, isLiveTracking, tokenData } = ctx.session;
       const tokenId = `${chain}:${address}`;
 
       try {
@@ -290,15 +308,19 @@ export const setupBot = (token) => {
           startMarketCap: tokenData.marketCap,
           startVolumeH1: tokenData.volumeH1,
           lastMarketCap: tokenData.marketCap,
+          lastLiveMc: isLiveTracking ? tokenData.marketCap : 0,
+          livePeakMc: isLiveTracking ? tokenData.marketCap : 0,
+          liveTroughMc: isLiveTracking ? tokenData.marketCap : 0,
           lastVolumeM5: tokenData.volumeM5,
           lastVolumeH1: tokenData.volumeH1,
+          isLiveTracking: isLiveTracking,
           isActive: true
         });
 
         await token.save();
         ctx.session = null;
         ctx.answerCbQuery('Monitoring started!');
-        ctx.reply(`✅ *Success!* Started monitoring *${tokenData.name}* (${tokenData.symbol}).\nThresholds: MC: ${mcThreshold}% | Vol: ${volThreshold}%`, { parse_mode: 'Markdown' });
+        ctx.reply(`✅ *Success!* Started monitoring *${tokenData.name}* (${tokenData.symbol}).\nThresholds: MC: ${mcThreshold}% | Vol: ${volThreshold}%${isLiveTracking ? ' | Live: YES' : ''}`, { parse_mode: 'Markdown' });
       } catch (error) {
         ctx.reply('Error saving: ' + error.message);
       }
@@ -335,11 +357,19 @@ export const setupBot = (token) => {
         `*Stats:*\n` +
         `📡 Total Scans: *${token.scanCount || 0}*\n` +
         `📈 MC Threshold: *${token.marketCapThreshold}%*\n` +
-        `🔊 Vol Threshold: *${token.volumeThreshold}%*\n`;
+        `🔊 Vol Threshold: *${token.volumeThreshold}%*\n` +
+        `🔥 Live Tracking: *${token.isLiveTracking ? 'ENABLED ✅' : 'DISABLED ❌'}*\n` +
+        (token.isLiveTracking ? `🏔 Live Peak: *$${(token.livePeakMc || 0).toLocaleString()}*\n` : '') +
+        (token.isLiveTracking ? `⤴️ Live Trough: *$${(token.liveTroughMc || 0).toLocaleString()}*\n` : '');
 
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.url('📈 View on DexScreener', `https://dexscreener.com/${token.chain}/${token.tokenAddress}`)],
         [Markup.button.callback('📉 Update MC', `new_threshold:${token._id}`), Markup.button.callback('🔊 Update Vol', `new_threshold:${token._id}`)],
+        [
+          token.isLiveTracking
+            ? Markup.button.callback('⏸ Disable Live Update', `toggle_live:${token._id}`)
+            : Markup.button.callback('🔥 Enable Live Update', `toggle_live:${token._id}`)
+        ],
         [
           token.isActive
             ? Markup.button.callback('⏸ Pause Monitoring', `disable:${token._id}`)
@@ -376,6 +406,13 @@ export const setupBot = (token) => {
       await Stats.findOneAndUpdate({}, { tokenDelayMs: ms }, { upsert: true });
       ctx.answerCbQuery(`Token delay set to ${ms}ms`);
       ctx.reply(`✅ *System update:* Inter-token delay changed to *${ms}ms*`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (data === 'cfg_live_th') {
+      ctx.session = { step: 'awaiting_live_th' };
+      ctx.answerCbQuery();
+      ctx.reply('Please enter the NEW Live Track Movement Threshold (%):');
       return;
     }
 
@@ -418,7 +455,10 @@ export const setupBot = (token) => {
         lastMarketCap: live.marketCap,
         lastVolumeM5: live.volumeM5,
         lastVolumeH1: live.volumeH1,
-        lastAlertAt: null
+        lastAlertAt: null,
+        lastLiveMc: live.marketCap,
+        livePeakMc: live.marketCap,
+        liveTroughMc: live.marketCap
       });
 
       ctx.answerCbQuery('✅ Baseline reset!');
@@ -478,11 +518,35 @@ export const setupBot = (token) => {
         tokenId: token.tokenId,
         _id: token._id
       };
-      // Overwrite the step in session to handle update logic
-      ctx.session.step = 'awaiting_update_mc';
       ctx.answerCbQuery();
       ctx.reply('Enter the NEW Market Cap Change Threshold (%):');
       return;
+    }
+
+    if (data === 'toggle_live_init') {
+      ctx.session.isLiveTracking = !ctx.session.isLiveTracking;
+      ctx.answerCbQuery();
+      await setupConfigurator(ctx, ctx.session.chain, ctx.session.address);
+      return;
+    }
+
+    if (data.startsWith('toggle_live:')) {
+      const id = data.split(':')[1];
+      const token = await Token.findById(id);
+      if (!token) return ctx.answerCbQuery('Token not found');
+
+      const newState = !token.isLiveTracking;
+      await Token.findByIdAndUpdate(id, { 
+        isLiveTracking: newState,
+        lastLiveMc: newState ? token.lastMarketCap : 0, // Set baseline if enabling
+        livePeakMc: newState ? token.lastMarketCap : 0, // Reset peak if enabling
+        liveTroughMc: newState ? token.lastMarketCap : 0 // Reset trough if enabling
+      });
+
+      ctx.answerCbQuery(`Live update ${newState ? 'enabled' : 'disabled'}`);
+      // Refresh details view
+      ctx.callbackQuery.data = `load_details:${id}`;
+      return bot.handleUpdate(ctx.update);
     }
   });
 

@@ -18,7 +18,11 @@ const tokenSchema = new mongoose.Schema({
   lastVolumeH1: { type: Number, default: 0 },
   lastAlertAt: { type: Date, default: null },
   cooldownMs: { type: Number, default: 180000 }, // 3 minutes
-  isActive: { type: Boolean, default: true }
+  isActive: { type: Boolean, default: true },
+  isLiveTracking: { type: Boolean, default: false },
+  lastLiveMc: { type: Number, default: 0 },
+  livePeakMc: { type: Number, default: 0 },
+  liveTroughMc: { type: Number, default: 0 }
 }, { timestamps: true });
 
 export const Token = mongoose.model('Token', tokenSchema);

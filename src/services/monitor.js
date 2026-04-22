@@ -46,10 +46,66 @@ export const runMonitor = async (bot) => {
       // Skip if it's the first time we fetch data (prev values are 0)
       if (token.lastMarketCap === 0 && token.lastVolumeM5 === 0 && token.lastVolumeH1 === 0) {
         token.lastMarketCap = currentMarketCap;
+        token.lastLiveMc = currentMarketCap; // Initialize live MC baseline
         token.lastVolumeM5 = currentM5;
         token.lastVolumeH1 = currentH1;
         await token.save();
         continue;
+      }
+
+      // --- LIVE TRACKING LOGIC ---
+      if (token.isLiveTracking && token.lastLiveMc > 0) {
+        // Update Peak and Trough
+        if (currentMarketCap > token.livePeakMc) token.livePeakMc = currentMarketCap;
+        if (token.liveTroughMc === 0 || currentMarketCap < token.liveTroughMc) token.liveTroughMc = currentMarketCap;
+
+        const liveMcChange = ((currentMarketCap - token.lastLiveMc) / token.lastLiveMc) * 100;
+        const absLiveChange = Math.abs(liveMcChange);
+
+        if (absLiveChange >= (globalStats.liveTrackThreshold || 10)) {
+          const isBullish = liveMcChange > 0;
+          const statusEmoji = isBullish ? '📈 Bullish' : '📉 Bearish';
+          const directionText = isBullish ? 'making progress' : 'falling';
+          
+          let peakInfo = '';
+          if (token.livePeakMc > 0) {
+            const drawdown = ((currentMarketCap - token.livePeakMc) / token.livePeakMc) * 100;
+            if (currentMarketCap >= token.livePeakMc) {
+              peakInfo = `🚀 *NEW PEAK ACHIEVED!*`;
+            } else {
+              peakInfo = `🏔 *Last Peak:* $${token.livePeakMc.toLocaleString()}\n` +
+                         `📉 *Drawdown:* ${drawdown.toFixed(2)}%`;
+            }
+          }
+
+          let troughInfo = '';
+          if (!isBullish && token.liveTroughMc > 0 && currentMarketCap > token.liveTroughMc) {
+             const recovery = ((currentMarketCap - token.liveTroughMc) / token.liveTroughMc) * 100;
+             troughInfo = `\n⤴️ *Recovery from Trough:* +${recovery.toFixed(2)}%`;
+          } else if (isBullish && token.liveTroughMc > 0) {
+             const recovery = ((currentMarketCap - token.liveTroughMc) / token.liveTroughMc) * 100;
+             troughInfo = `\n⤴️ *Recovery from Trough:* +${recovery.toFixed(2)}%`;
+          }
+
+          const liveMessage = `${statusEmoji} *UPDATE: ${data.symbol}* ${statusEmoji}\n\n` +
+                              `The token is *${directionText}*!\n` +
+                              `*Market Cap:* $${currentMarketCap.toLocaleString()} (${liveMcChange.toFixed(2)}%)\n` +
+                              `*Price:* $${data.priceUsd}\n\n` +
+                              `${peakInfo}${troughInfo}\n\n` +
+                              `_Tracking movement relative to last alert._`;
+
+          const liveKeyboard = [
+            [{ text: '📈 View on DexScreener', url: data.dexUrl || `https://dexscreener.com/${token.chain}/${token.tokenAddress}` }],
+            [{ text: '⏸ Stop Live Tracking', callback_data: `toggle_live:${token._id}` }]
+          ];
+
+          await bot.telegram.sendMessage(token.userId, liveMessage, {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: liveKeyboard }
+          });
+
+          token.lastLiveMc = currentMarketCap;
+        }
       }
 
       // 1. Calculate Market Cap Change
@@ -134,6 +190,7 @@ export const runMonitor = async (bot) => {
                         `📊 *Current Vol (1h):* $${currentH1.toLocaleString()}\n`;
         
         const keyboard = [
+          [{ text: '📈 View on DexScreener', url: data.dexUrl || `https://dexscreener.com/${token.chain}/${token.tokenAddress}` }],
           [{ text: '⏸ Disable Alert', callback_data: `disable:${token._id}` }],
           [{ text: '📊 Set New Thresholds', callback_data: `new_threshold:${token._id}` }]
         ];

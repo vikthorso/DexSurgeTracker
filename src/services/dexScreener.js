@@ -18,6 +18,7 @@ export const fetchTokenData = async (chain, tokenAddress) => {
         volumeH1: pair.volume?.h1 || 0,
         symbol: pair.baseToken?.symbol || 'UNKNOWN',
         name: pair.baseToken?.name || 'UNKNOWN',
+        dexUrl: `https://dexscreener.com/${chain}/${tokenAddress}`,
         success: true
       };
     }
