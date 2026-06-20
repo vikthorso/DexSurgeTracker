@@ -1,9 +1,9 @@
+import dotenv from 'dotenv';
 import express from 'express';
 import mongoose from 'mongoose';
-import dotenv from 'dotenv';
-import { setupBot } from './bot/bot.js';
-import { setupCron } from './services/cron.js';
 import apiRoutes from './api/routes.js';
+import { setupBot } from './bot/bot.js';
+import { setupCron, setupTrendingCron } from './services/cron.js';
 
 console.log('🏁 Starting Dex Volume Monitor...');
 
@@ -40,6 +40,10 @@ mongoose.connect(MONGO_URI)
     console.log('📡 Starting Monitoring Engine...');
     setupCron(bot);
     
+    // 2b. Start Trending Discovery Scheduler
+    console.log('🌊 Starting Trending Discovery...');
+    setupTrendingCron(bot);
+    
     // 3. Launch Bot (Async)
     bot.launch()
       .then(() => {
@@ -58,6 +62,13 @@ mongoose.connect(MONGO_URI)
     console.error('❌ MongoDB Connection Error:', err.message);
     process.exit(1);
   });
+
+// Global unhandled rejection handler — prevents transient network errors
+// (e.g. ECONNRESET on Telegram API calls) from crashing the entire process.
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Process] Unhandled promise rejection:', reason?.message || reason);
+  // Log but DON'T crash — network blips should not kill the bot
+});
 
 // Handle graceful shutdown
 process.once('SIGINT', () => {

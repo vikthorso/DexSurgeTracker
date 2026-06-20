@@ -7,7 +7,7 @@ import axios from 'axios';
 export const fetchTokenData = async (chain, tokenAddress) => {
   try {
     const url = `https://api.dexscreener.com/token-pairs/v1/${chain}/${tokenAddress}`;
-    const response = await axios.get(url);
+    const response = await axios.get(url, { timeout: 30000 }); // 30s timeout to prevent hung requests
     
     if (response.data && Array.isArray(response.data) && response.data.length > 0) {
       const pair = response.data[0];
