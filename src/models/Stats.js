@@ -26,7 +26,45 @@ const statsSchema = new mongoose.Schema({
   bounceConfirmMinScans: { type: Number, default: 3 },          // 3 consecutive scans above trough
 
   // Dead cat bounce master toggle
-  deadCatBounceEnabled: { type: Boolean, default: true }
+  deadCatBounceEnabled: { type: Boolean, default: true },
+
+  // Dynamic account types for leverage strategy context — JSON array
+  // Each object: { id, label, type (HLA/LLA), balance, leverage, capitalMax, capitalPct, goal }
+  accountTypes: {
+    type: String,
+    default: JSON.stringify([
+      {
+        "id": "bybit",
+        "label": "Day trading (Bybit)",
+        "type": "HLA",
+        "balance": 100,
+        "leverage": 20,
+        "capitalMax": 4,
+        "capitalPct": 4,
+        "goal": "maximum profit from top or bottom"
+      },
+      {
+        "id": "mexc",
+        "label": "Scalping (Mexc)",
+        "type": "HLA",
+        "balance": 500,
+        "leverage": 20,
+        "capitalMax": 50,
+        "capitalPct": 10,
+        "goal": "20% RIO for $5 daily, 1:1 tp:sl, trending market only, must go with the market"
+      },
+      {
+        "id": "binance",
+        "label": "Day trading (Binance)",
+        "type": "LLA",
+        "balance": 1000,
+        "leverage": 5,
+        "capitalMax": 100,
+        "capitalPct": 10,
+        "goal": "10-20% move (1-2x return)"
+      }
+    ])
+  }
 });
 
 export const Stats = mongoose.model('Stats', statsSchema);

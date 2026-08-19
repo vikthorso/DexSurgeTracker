@@ -1,6 +1,6 @@
 # DexSurgeTracker
 
-A production-ready Telegram bot that monitors Solana, Base, Ethereum, and BSC tokens for market cap and volume spikes using the DexScreener API, CoinGecko-powered trending niche discovery, AI-powered leverage grid DCA strategy calculation via DeepSeek and Grok, tokenomics/holder analysis via Moralis, and real-time token research (FUD, unlocks, investors) via Grok web search.
+A production-ready Telegram bot that monitors Solana, Base, Ethereum, BSC, Hyperliquid, and Sui tokens for market cap and volume spikes using the DexScreener API, CoinGecko-powered trending niche discovery, AI-powered leverage grid DCA strategy calculation via DeepSeek and Grok, tokenomics/holder analysis via Moralis, and real-time token research (FUD, unlocks, investors) via Grok web search.
 
 ---
 
@@ -80,6 +80,8 @@ A production-ready Telegram bot that monitors Solana, Base, Ethereum, and BSC to
 - **30-second axios timeouts** on DexScreener, CoinGecko, and AI API calls.
 - **CoinGecko rate limiting**: 2s minimum interval between calls, 2-min cooldown on manual `/trending`.
 - **Snapshot auto-cleanup**: keeps only the last 180 trending snapshots (~30 days at 4h intervals).
+- **Global unhandled rejection handler** — catches any unhandled promise rejection (e.g. ECONNRESET from Telegram API) and logs it instead of crashing the Node process.
+- **Wrapped `answerCbQuery`** — all 53 callback acknowledgment calls in [`bot.js`](src/bot/bot.js:585) are automatically protected against transient network errors. Silently logged, never crashes.
 
 ---
 

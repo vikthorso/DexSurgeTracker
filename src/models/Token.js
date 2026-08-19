@@ -24,6 +24,10 @@ const tokenSchema = new mongoose.Schema({
   livePeakMc: { type: Number, default: 0 },
   liveTroughMc: { type: Number, default: 0 },
   lastLiveMessageId: { type: Number },
+
+  // Surge alert baseline — only updates when an alert fires, NOT every scan
+  surgeBaselineMc: { type: Number, default: 0 },
+  surgeBaselineVol: { type: Number, default: 0 },
   liveConsecutiveCount: { type: Number, default: 0 },
   liveConsecutiveType: { type: String, enum: ['bullish', 'bearish', null], default: null },
   lastReportedType: { type: String, enum: ['bullish', 'bearish', null], default: null },
@@ -65,9 +69,15 @@ const tokenSchema = new mongoose.Schema({
   // General stagnation alert cooldown
   stagnationAlertedAt: { type: Date, default: null },
   stagnationLastType: { type: String, enum: ['long', 'short', null], default: null },
+  stagnationLastPct: { type: Number, default: null },
+  stagnationRange: [{ type: Number }],
 
   // Per-token stagnation toggle
-  isStagnationTracking: { type: Boolean, default: false }
+  isStagnationTracking: { type: Boolean, default: false },
+
+  // Funding rate integration — cached matched CEX perp instruments
+  fundingSymbols: [{ type: String }],
+  lastFundingFetchAt: { type: Date, default: null }
 }, { timestamps: true });
 
 export const Token = mongoose.model('Token', tokenSchema);

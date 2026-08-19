@@ -1,21 +1,51 @@
 import { Markup, Telegraf, session } from 'telegraf';
 import { Stats } from '../models/Stats.js';
 import { Token } from '../models/Token.js';
+import { Investors } from '../models/Investors.js';
 import { updateMonitorInterval, updateTrendingInterval } from '../services/cron.js';
 import { getLeverageStrategy } from '../services/deepseek.js';
 import { fetchTokenData } from '../services/dexScreener.js';
 import { getGrokStrategy } from '../services/grok.js';
-import { checkFUD, checkUpcomingUnlocks, formatFUDResult, formatInvestorsResult, formatUnlocksResult, researchInvestors } from '../services/grokResearch.js';
-import { formatLeverageOutput } from '../services/levTemplate.js';
+import { checkFUD, checkUpcomingUnlocks, formatFUDResult, formatInvestorsMMResult, formatUnlocksResult, researchInvestorsMM } from '../services/grokResearch.js';
+import { parseAccountTypes, DEFAULT_ACCOUNT_TYPES } from '../services/levTemplate.js';
 import { getSentimentInfo } from '../services/monitor.js';
-import { getTokenMetadata, getTopHolders, isEVMChain } from '../services/moralis.js';
+import { getTokenMetadata, getTopHolders } from '../services/moralis.js';
 import { manualTrending, sendBearishReport, sendBullishReport } from '../services/trendingMonitor.js';
+import { getFundingRate, formatFundingLine, interpretFunding } from '../services/fundingRate.js';
 
 // Helper for percentage change
 const getPercentChange = (base, current) => {
   if (!base || !current) return '0.00';
   const change = ((current - base) / base) * 100;
   return change.toFixed(2);
+};
+
+// Auto-detect current day of week for leverage strategy context
+const getDayOfWeek = () => {
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  return days[new Date().getDay()];
+};
+
+// Auto-detect current hour + session for leverage strategy context
+const getHourOfDay = () => {
+  const now = new Date();
+  const h = now.getHours();
+  const m = now.getMinutes().toString().padStart(2, '0');
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12 = h % 12 || 12;
+  const timeStr = `${h12}:${m} ${ampm}`;
+  let session = '';
+  if (h >= 1 && h < 4) session = 'Late night (low liq)';
+  else if (h >= 4 && h < 7) session = 'Pre-market (Asia)';
+  else if (h >= 7 && h < 9) session = 'Pre-market (Europe)';
+  else if (h >= 9 && h < 11) session = 'RTH Open';
+
+  else if (h >= 11 && h < 14) session = 'Midday';
+  else if (h >= 14 && h < 16) session = 'Afternoon';
+  else if (h >= 16 && h < 18) session = 'Europe close';
+  else if (h >= 18 && h < 21) session = 'Evening (US after hours)';
+  else session = 'Late night (low liq)';
+  return `${timeStr} / ${session}`;
 };
 
 export const setupBot = (token) => {
@@ -41,12 +71,11 @@ export const setupBot = (token) => {
     { command: 'trending', description: 'Discover trending niches' },
     { command: 'config', description: 'System status & configuration' },
     { command: 'remove', description: 'Stop monitoring a token' },
-    { command: 'leverage', description: 'Leverage grid DCA strategy calculator' },
-    { command: 'research', description: 'Research a token (tokenomics, holders, FUD, unlocks, investors)' }
+    { command: 'leverage', description: 'Leverage grid DCA strategy calculator' }
   ]);
 
   bot.start((ctx) => {
-    ctx.reply('🚀 Welcome to Dex Volume Monitor!\n\nUse /add to start monitoring a new token.\nUse /trending to discover trending niches.\nUse /leverage for grid DCA strategy calc.\nUse /research to analyze tokenomics, holders, FUD, unlocks & investors.\nCommands: /add, /remove, /list, /trending, /config, /leverage, /research');
+    ctx.reply('🚀 Welcome to Dex Volume Monitor!\n\nUse /add to start monitoring a new token.\nUse /trending to discover trending niches.\nUse /leverage for grid DCA strategy calc.\nCommands: /add, /remove, /list, /trending, /config, /leverage');
   });
 
   // --- LEVERAGE STRATEGY FLOW ---
@@ -55,9 +84,37 @@ export const setupBot = (token) => {
     if (ctx.session?.lastLevQuestionId) {
       ctx.telegram.deleteMessage(ctx.chat.id, ctx.session.lastLevQuestionId).catch(() => {});
     }
-    const msg = await ctx.reply('⚙️ *Leverage Grid DCA Strategy Calculator*\n\nPlease enter your *Leverage* (e.g. 5 for 5x):', { parse_mode: 'Markdown' });
-    ctx.session = { step: 'awaiting_leverage', lastLevQuestionId: msg.message_id, levTriggerMsgId: ctx.message.message_id };
+    await showConfigMode(ctx, ctx.message.message_id);
   });
+
+  /**
+   * Shows the config mode selection — "Manual Input" vs available account types.
+   * Reused by both /leverage command and lev_strategy button callback.
+   */
+  const showConfigMode = async (ctx, triggerMsgId, prefill = {}) => {
+    const stats = await Stats.findOne();
+    const raw = stats?.accountTypes || DEFAULT_ACCOUNT_TYPES;
+    const accounts = parseAccountTypes(raw);
+
+    const buttons = [
+      [Markup.button.callback('📝 Manual Input', 'lev_config:manual')]
+    ];
+    for (const acct of accounts) {
+      buttons.push([Markup.button.callback(`${acct.type === 'HLA' ? '📊' : '📈'} ${acct.label}`, `lev_config:${acct.id}`)]);
+    }
+
+    const msg = await ctx.reply('⚙️ *How would you like to configure your trade?*', {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    });
+
+    ctx.session = {
+      step: 'awaiting_lev_config_mode',
+      lastLevQuestionId: msg.message_id,
+      levTriggerMsgId: triggerMsgId,
+      ...prefill
+    };
+  };
 
   // Helper to handle address/URL input
   const processAddress = async (ctx, input) => {
@@ -67,7 +124,7 @@ export const setupBot = (token) => {
     // Simple URL parsing
     if (address.includes('dexscreener.com')) {
       const parts = address.split('/');
-      const chainIdx = parts.findIndex(p => ['solana', 'base', 'ethereum', 'bsc'].includes(p.toLowerCase()));
+      const chainIdx = parts.findIndex(p => ['solana', 'base', 'ethereum', 'bsc', 'hyperliquid', 'sui'].includes(p.toLowerCase()));
       if (chainIdx !== -1) {
         chain = parts[chainIdx];
         address = parts[chainIdx + 1];
@@ -81,7 +138,8 @@ export const setupBot = (token) => {
       ctx.session.step = 'selecting_chain';
       await ctx.reply('Select the chain:', Markup.inlineKeyboard([
         [Markup.button.callback('Solana', 'chain:solana'), Markup.button.callback('Base', 'chain:base')],
-        [Markup.button.callback('Ethereum', 'chain:ethereum'), Markup.button.callback('BSC', 'chain:bsc')]
+        [Markup.button.callback('Ethereum', 'chain:ethereum'), Markup.button.callback('BSC', 'chain:bsc')],
+        [Markup.button.callback('Hyperliquid', 'chain:hyperliquid'), Markup.button.callback('SUI', 'chain:sui')]
       ]));
     }
   };
@@ -251,7 +309,8 @@ export const setupBot = (token) => {
         [Markup.button.callback('📊 Stag. Win', 'cfg_stag_win'), Markup.button.callback('📈 Stag. %', 'cfg_stag_pct'), Markup.button.callback('⏰ Stag. CD', 'cfg_stag_cd')],
         [Markup.button.callback('📉 Crash %', 'cfg_crash_pct'), Markup.button.callback('🕐 Crash Win', 'cfg_crash_win')],
         [Markup.button.callback('📈 Bounce %', 'cfg_bounce_pct'), Markup.button.callback('🔢 Bounce Scans', 'cfg_bounce_scans'), Markup.button.callback('🐱 DCB Toggle', 'cfg_dcb_toggle')],
-        [Markup.button.callback('� Dismiss', 'dismiss')]
+        [Markup.button.callback('📋 Edit Account Types', 'cfg_edit_account_types')],
+        [Markup.button.callback('❌ Dismiss', 'dismiss')]
       ]);
 
       await ctx.replyWithMarkdown(message, keyboard);
@@ -278,38 +337,7 @@ export const setupBot = (token) => {
     }
   });
 
-  bot.command('research', async (ctx) => {
-    try {
-      const payload = ctx.payload?.trim();
-      const tokens = await Token.find({ userId: ctx.from.id.toString() });
-
-      if (tokens.length === 0) {
-        return ctx.reply('No tokens to research. Use /add to start monitoring a token, then /research to analyze it.');
-      }
-
-      // If payload is a token ID, jump straight to research menu
-      if (payload) {
-        const token = await Token.findById(payload);
-        if (!token) return ctx.reply('Token not found.');
-        // Simulate the research_menu callback
-        ctx.callbackQuery = { data: `research_menu:${token._id}`, message: ctx.message };
-        return bot.handleUpdate(ctx.update);
-      }
-
-      // Otherwise show token picker
-      const buttons = tokens.map(t => {
-        const label = t.name ? `${t.symbol} — ${t.name}` : t.symbol;
-        return [Markup.button.callback(`🔍 ${label}`, `research_menu:${t._id}`)];
-      });
-
-      ctx.reply('🔍 <b>Research a Token</b>\n\nSelect a token to research:\n\n<i>Tokenomics & Holders via Moralis (EVM) | FUD, Unlocks & Investors via Grok</i>', {
-        parse_mode: 'HTML',
-        ...Markup.inlineKeyboard(buttons)
-      });
-    } catch (error) {
-      ctx.reply('Error: ' + error.message);
-    }
-  });
+  // --- COMMAND: STAGING AREA (research moved to live token view buttons) ---
 
   // --- ACTIONS ---
   bot.on('text', async (ctx) => {
@@ -440,11 +468,38 @@ export const setupBot = (token) => {
       return;
     }
 
+    if (state.step === 'awaiting_account_types') {
+      const input = ctx.message.text.trim();
+      if (input.toLowerCase() === 'cancel') {
+        ctx.session = null;
+        ctx.reply('Account types edit cancelled.');
+        return;
+      }
+      // Validate that input is valid JSON array with required fields
+      let parsed;
+      try {
+        parsed = JSON.parse(input);
+        if (!Array.isArray(parsed)) throw new Error('Must be a JSON array');
+        for (const item of parsed) {
+          if (!item.id || !item.label || !item.type || !item.balance || !item.leverage || !item.capitalMax) {
+            throw new Error(`Missing required field in item: ${item.id || '(unnamed)'}`);
+          }
+        }
+      } catch (err) {
+        ctx.reply(`❌ Invalid JSON: ${err.message}\n\nReply with a valid JSON array or type "cancel" to abort.`);
+        return;
+      }
+      await Stats.findOneAndUpdate({}, { accountTypes: input }, { upsert: true });
+      ctx.session = null;
+      ctx.reply(`✅ *Success:* Account Types updated. Changes will be reflected in the next leverage strategy wizard.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
     // --- LEVERAGE WIZARD STEPS ---
     if (state.step === 'awaiting_leverage') {
       const val = parseFloat(ctx.message.text);
-      if (isNaN(val) || val < 1) return ctx.reply('Invalid. Enter a leverage value (e.g. 5 for 5x, min 1):');
-      if (val > 5) return ctx.reply('⚠️ Max 5x leverage allowed. Please enter 5 or lower:');
+      if (isNaN(val) || val < 1) return ctx.reply('Invalid. Enter a leverage value (e.g. 10 for 10x, min 1):');
+      if (val > 50) return ctx.reply('⚠️ Max 50x leverage allowed. Please enter 50 or lower:');
       ctx.session.leverage = val;
       ctx.session.step = 'awaiting_lev_amount';
       // Delete previous question
@@ -542,21 +597,6 @@ export const setupBot = (token) => {
       return;
     }
 
-    if (state.step === 'awaiting_lev_direction') {
-      ctx.session.levDirection = ctx.message.text.toLowerCase();
-      if (!['long', 'short'].includes(ctx.session.levDirection)) {
-        return ctx.reply('Please reply "long" or "short":');
-      }
-      ctx.session.step = 'awaiting_lev_context';
-      // Delete previous question (the mode-selection message)
-      if (ctx.session.lastLevQuestionId) {
-        ctx.telegram.deleteMessage(ctx.chat.id, ctx.session.lastLevQuestionId).catch(() => {});
-      }
-      const msg = await ctx.reply(`✅ Direction: *${ctx.session.levDirection.toUpperCase()}*\n\n(Optional) Enter *Token Category/Niche Context* (e.g. "low cap meme, pump fun", or type "skip" to skip):`, { parse_mode: 'Markdown' });
-      ctx.session.lastLevQuestionId = msg.message_id;
-      return;
-    }
-
     if (state.step === 'awaiting_lev_context') {
       const input = ctx.message.text.trim();
       const tokenContext = input.toLowerCase() === 'skip' ? '' : input;
@@ -623,6 +663,7 @@ export const setupBot = (token) => {
           return ctx.reply(`You are already monitoring ${tokenId}.`);
         }
 
+        const statsDoc = await Stats.findOne();
         const token = new Token({
           userId: ctx.from.id.toString(),
           chain,
@@ -642,7 +683,10 @@ export const setupBot = (token) => {
           lastVolumeM5: tokenData.volumeM5,
           lastVolumeH1: tokenData.volumeH1,
           isLiveTracking: isLiveTracking,
-          isActive: true
+          isActive: true,
+          cooldownMs: statsDoc?.globalCooldownMs || 180000,
+          surgeBaselineMc: tokenData.marketCap,
+          surgeBaselineVol: tokenData.volumeH1
         });
 
         await token.save();
@@ -715,63 +759,29 @@ export const setupBot = (token) => {
           Markup.button.callback('💥 Test Crash', `test_crash:${token._id}`)
         ],
         [
+          Markup.button.callback('💸 Test Funding', `test_funding:${token._id}`)
+        ],
+        [
           token.isStagnationTracking
             ? Markup.button.callback('📊 Disable Stagnation', `toggle_stagnation:${token._id}`)
             : Markup.button.callback('📊 Enable Stagnation', `toggle_stagnation:${token._id}`)
         ],
         [
-          Markup.button.callback('⚖️ Lev Strategy', `lev_strategy:${token._id}`),
-          Markup.button.callback('🔍 Research', `research_menu:${token._id}`),
-          Markup.button.callback('🐦 FUD on X', `research:fud:${token._id}`)
+          Markup.button.callback('⚖️ Lev Strategy', `lev_strategy:${token._id}`)
+        ],
+        [
+          Markup.button.callback('📊 Tokenomics', `research:tokenomics:${token._id}`),
+          Markup.button.callback('👥 Holders', `research:holders:${token._id}`),
+          Markup.button.callback('🔓 Unlocks', `research:unlocks:${token._id}`)
+        ],
+        [
+          Markup.button.callback('🐦 FUD on X', `research:fud:${token._id}`),
+          Markup.button.callback('💰 Investor Backers', `research:investors:${token._id}`)
         ],
         [Markup.button.callback('⬅️ Back to List', 'list_page:1'), Markup.button.callback('🗑 Dismiss', 'dismiss')]
       ]);
 
       await ctx.editMessageText(card, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-      return;
-    }
-
-    // ====================================================================
-    // RESEARCH MENU — Show research sub-menu for a token
-    // ====================================================================
-    if (data.startsWith('research_menu:')) {
-      const id = data.split(':')[1];
-      const token = await Token.findById(id);
-      if (!token) return ctx.answerCbQuery('Token not found');
-
-      ctx.answerCbQuery();
-      const symbol = token.symbol || token.tokenId;
-      const isEVM = isEVMChain(token.chain);
-
-      let menuText = `🔍 <b>Research: ${symbol}</b>\nWhat would you like to research?\n\n`;
-
-      let buttons;
-      if (isEVM) {
-        menuText += `<i>Moralis (on-chain) + Grok (web research)</i>`;
-        buttons = [
-          [Markup.button.callback('📊 Tokenomics', `research:tokenomics:${token._id}`), Markup.button.callback('👥 Top 10 Holders', `research:holders:${token._id}`)],
-          [Markup.button.callback('🔓 Upcoming Unlocks', `research:unlocks:${token._id}`), Markup.button.callback('🐦 FUD on X', `research:fud:${token._id}`)],
-          [Markup.button.callback('💰 Investor Backers', `research:investors:${token._id}`)],
-          [Markup.button.callback('⬅️ Back to Detail', `load_details:${token._id}`), Markup.button.callback('🗑 Dismiss', 'dismiss')]
-        ];
-      } else {
-        menuText += `<i>⚠️ Tokenomics & holder data unavailable for Solana via Moralis.</i>\n\n<i>Grok web research available:</i>`;
-        buttons = [
-          [Markup.button.callback('🔓 Upcoming Unlocks', `research:unlocks:${token._id}`), Markup.button.callback('🐦 FUD on X', `research:fud:${token._id}`)],
-          [Markup.button.callback('💰 Investor Backers', `research:investors:${token._id}`)],
-          [Markup.button.callback('⬅️ Back to Detail', `load_details:${token._id}`), Markup.button.callback('🗑 Dismiss', 'dismiss')]
-        ];
-      }
-
-      try {
-        await ctx.editMessageText(menuText, {
-          parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: buttons }
-        });
-      } catch (err) {
-        // If edit fails (e.g. from command context), send new
-        ctx.replyWithHTML(menuText, Markup.inlineKeyboard(buttons));
-      }
       return;
     }
 
@@ -927,22 +937,18 @@ export const setupBot = (token) => {
     }
 
     // ====================================================================
-    // RESEARCH: Investor Backers (Grok)
+    // RESEARCH: Investor Backers (Grok + DB cache)
     // ====================================================================
-    if (data.startsWith('research:investors:')) {
+    if (data.startsWith('research:investors_refresh:')) {
       const id = data.split(':')[2];
       const token = await Token.findById(id);
       if (!token) return ctx.answerCbQuery('Token not found');
 
-      ctx.answerCbQuery('Researching investors via Grok...');
-      const loadingMsg = await ctx.reply(`💰 <b>Researching investors & backers for ${token.symbol || token.tokenId}...</b>`, { parse_mode: 'HTML' });
+      ctx.answerCbQuery('Re-researching investors...');
+      const loadingMsg = await ctx.reply(`💰 <b>Re-researching investors & backers for ${token.symbol || token.tokenId}...</b>`, { parse_mode: 'HTML' });
 
-      const freshData = await fetchTokenData(token.chain, token.tokenAddress);
-      const marketCap = freshData.success ? freshData.marketCap : token.lastMarketCap;
+      const result = await researchInvestorsMM(token.name || token.symbol, token.symbol, token.tokenAddress, token.chain);
 
-      const result = await researchInvestors(token.name || token.symbol, token.symbol, token.chain, marketCap);
-
-      // Clean up loading
       ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
       if (!result.success) {
@@ -950,8 +956,80 @@ export const setupBot = (token) => {
         return;
       }
 
-      const formatted = formatInvestorsResult(result.result, token.symbol);
-      ctx.replyWithHTML(formatted);
+      await Investors.findOneAndUpdate(
+        { tokenId: token.tokenId },
+        {
+          $set: {
+            token: token._id,
+            symbol: token.symbol,
+            name: token.name,
+            chain: token.chain,
+            tokenAddress: token.tokenAddress,
+            result: result.result,
+            model: result.model || 'grok-4.6'
+          }
+        },
+        { upsert: true }
+      );
+
+      const formatted = formatInvestorsMMResult(result.result, token.symbol);
+      const keyboard = [
+        [Markup.button.callback('🔄 Refresh', `research:investors_refresh:${token._id}`), Markup.button.callback('🗑 Dismiss', 'dismiss')]
+      ];
+
+      ctx.replyWithHTML(formatted, Markup.inlineKeyboard(keyboard));
+      return;
+    }
+
+    if (data.startsWith('research:investors:')) {
+      const id = data.split(':')[2];
+      const token = await Token.findById(id);
+      if (!token) return ctx.answerCbQuery('Token not found');
+
+      // Serve cached research if it already exists
+      const existing = await Investors.findOne({ tokenId: token.tokenId });
+      if (existing?.result) {
+        ctx.answerCbQuery('Loading cached research...');
+        const cachedAt = new Date(existing.updatedAt || existing.createdAt).toLocaleString();
+        const formatted = formatInvestorsMMResult(existing.result, token.symbol) +
+          `\n\n<i>⏱ Cached since: ${cachedAt}</i>`;
+        const keyboard = [
+          [Markup.button.callback('🔄 Refresh', `research:investors_refresh:${token._id}`), Markup.button.callback('🗑 Dismiss', 'dismiss')]
+        ];
+
+        ctx.replyWithHTML(formatted, Markup.inlineKeyboard(keyboard));
+        return;
+      }
+
+      ctx.answerCbQuery('Researching investors via Grok...');
+      const loadingMsg = await ctx.reply(`💰 <b>Researching investors & backers for ${token.symbol || token.tokenId}...</b>`, { parse_mode: 'HTML' });
+
+      const result = await researchInvestorsMM(token.name || token.symbol, token.symbol, token.tokenAddress, token.chain);
+
+      ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+
+      if (!result.success) {
+        ctx.reply(`❌ <b>Investor Research Error:</b> ${result.error}`, { parse_mode: 'HTML' });
+        return;
+      }
+
+      await Investors.create({
+        tokenId: token.tokenId,
+        token: token._id,
+        symbol: token.symbol,
+        name: token.name,
+        chain: token.chain,
+        tokenAddress: token.tokenAddress,
+        result: result.result,
+        model: result.model || 'grok-4.6'
+      });
+
+      const formatted = formatInvestorsMMResult(result.result, token.symbol);
+      const keyboard = [
+        [Markup.button.callback('🔄 Refresh', `research:investors_refresh:${token._id}`), Markup.button.callback('🗑 Dismiss', 'dismiss')]
+      ];
+
+      ctx.replyWithHTML(formatted, Markup.inlineKeyboard(keyboard));
       return;
     }
 
@@ -1070,6 +1148,24 @@ export const setupBot = (token) => {
       return;
     }
 
+    if (data === 'cfg_edit_account_types') {
+      ctx.answerCbQuery();
+      const stats = await Stats.findOne();
+      const current = stats?.accountTypes || '[]';
+      ctx.session = { step: 'awaiting_account_types' };
+      // Pretty-print JSON for readability
+      let pretty = current;
+      try { pretty = JSON.stringify(JSON.parse(current), null, 2); } catch {}
+      ctx.reply(
+        `📋 *Edit Account Types (JSON)*\n\n` +
+        `Current configuration:\n\`\`\`json\n${pretty}\n\`\`\`\n\n` +
+        `Reply with the *full updated JSON array*, or type *"cancel"* to abort.\n\n` +
+        `Each object needs: id, label, type (HLA/LLA), balance, leverage, capitalMax, capitalPct, goal`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
     // --- Per-Token Stagnation Toggle ---
     if (data.startsWith('toggle_stagnation:')) {
       const id = data.split(':')[1];
@@ -1082,7 +1178,9 @@ export const setupBot = (token) => {
         crashState: null,
         bounceConfirmationScans: 0,
         stagnationAlertedAt: null,
-        stagnationLastType: null
+        stagnationLastType: null,
+        stagnationLastPct: null,
+        stagnationRange: []
       });
 
       ctx.answerCbQuery(`Stagnation ${newState ? 'enabled' : 'disabled'}`);
@@ -1107,6 +1205,43 @@ export const setupBot = (token) => {
         [{ text: '📈 View on DexScreener', url: `https://dexscreener.com/${token.chain}/${token.tokenAddress}` }],
         [{ text: '⏸ Disable Alert', callback_data: `disable:${token._id}` }],
         [{ text: '📊 Set New Thresholds', callback_data: `new_threshold:${token._id}` }],
+        [{ text: '🗑 Dismiss', callback_data: 'dismiss' }]
+      ];
+
+      await ctx.replyWithMarkdown(message, { reply_markup: { inline_keyboard: keyboard } });
+      return;
+    }
+
+    if (data.startsWith('test_funding:')) {
+      const id = data.split(':')[1];
+      const token = await Token.findById(id);
+      if (!token) return ctx.answerCbQuery('Token not found');
+
+      ctx.answerCbQuery('Fetching funding rate...');
+
+      const funding = await getFundingRate(token.symbol);
+
+      if (!funding) {
+        ctx.replyWithMarkdown(
+          `💸 *FUNDING ALERT: ${token.symbol}*\n\n` +
+          `No perpetual futures market found for *${token.symbol}* on Bybit, MEXC, Binance, or Hyperliquid.\n\n` +
+          `_If the token has a CEX perp, verify the symbol spelling._`
+        );
+        return;
+      }
+
+      const line = formatFundingLine(funding);
+      const hintBullish = interpretFunding(funding, 'bullish');
+      const hintBearish = interpretFunding(funding, 'bearish');
+
+      const message = `💸 *FUNDING ALERT: ${token.symbol}* 💸\n\n` +
+        `${line}\n\n` +
+        `📈 *Bullish view:* ${hintBullish || 'Neutral — funding not a factor'}\n` +
+        `📉 *Bearish view:* ${hintBearish || 'Neutral — funding not a factor'}\n\n` +
+        `_This is a test — funding data fetched live from ${funding.exchange}._`;
+
+      const keyboard = [
+        [{ text: '📈 View on DexScreener', url: `https://dexscreener.com/${token.chain}/${token.tokenAddress}` }],
         [{ text: '🗑 Dismiss', callback_data: 'dismiss' }]
       ];
 
@@ -1149,7 +1284,7 @@ export const setupBot = (token) => {
       await token.save();
 
       // Send the Summary Ping
-      const summaryText = `📈 *BULLISH* update for *${token.symbol}* (+${mockChange.toFixed(1)}%) [TEST]`;
+      const summaryText = `🟢 ${token.symbol} (+${mockChange.toFixed(1)}%) [TEST]`;
       await bot.telegram.sendMessage(token.userId, summaryText, {
         parse_mode: 'Markdown',
         reply_to_message_id: msg.message_id
@@ -1346,23 +1481,69 @@ export const setupBot = (token) => {
         ctx.telegram.deleteMessage(ctx.chat.id, ctx.session.lastLevQuestionId).catch(() => {});
       }
 
-      const msg = await ctx.reply(
-        `⚖️ *Leverage Grid DCA Strategy*\n\n` +
-        `📋 *Pre-filled from ${token.symbol}:*\n` +
-        `💰 Entry Price: $${freshData.priceUsd}\n` +
-        `📊 Market Cap: $${(freshData.marketCap || 0).toLocaleString()}\n\n` +
-        `Please enter your *Leverage* (e.g. 5 for 5x):`,
-        { parse_mode: 'Markdown' }
-      );
-
-      ctx.session = {
-        step: 'awaiting_leverage',
+      await showConfigMode(ctx, ctx.callbackQuery.message.message_id, {
         levTokenId: id,
         prefillEntryPrice: parseFloat(freshData.priceUsd || '0'),
-        prefillMarketCap: freshData.marketCap || 0,
-        lastLevQuestionId: msg.message_id,
-        levTriggerMsgId: ctx.callbackQuery.message.message_id
-      };
+        prefillMarketCap: freshData.marketCap || 0
+      });
+      return;
+    }
+
+    if (data.startsWith('lev_config:')) {
+      const mode = data.split(':')[1]; // 'manual' or account id
+      ctx.answerCbQuery();
+      ctx.deleteMessage().catch(() => {});
+
+      if (mode === 'manual') {
+        ctx.session.step = 'awaiting_leverage';
+        const msg = await ctx.reply('⚙️ *Leverage Grid DCA Strategy Calculator*\n\nPlease enter your *Leverage* (e.g. 10 for 10x):', { parse_mode: 'Markdown' });
+        ctx.session.lastLevQuestionId = msg.message_id;
+        return;
+      }
+
+      // Account route — auto-fill defaults from JSON
+      const stats = await Stats.findOne();
+      const accounts = parseAccountTypes(stats?.accountTypes || '[]');
+      const acct = accounts.find(a => a.id === mode);
+      if (!acct) {
+        return ctx.reply('Account type not found. Please try again.');
+      }
+
+      ctx.session.leverage = acct.leverage;
+      ctx.session.levAmount = acct.capitalMax;
+      ctx.session.levAccountBalance = acct.balance;
+      ctx.session.levAccountType = acct.id;
+      ctx.session.levAccountLabel = acct.label;
+
+      // Extract prefill values into actual wizard fields
+      if (ctx.session.prefillEntryPrice) {
+        ctx.session.levEntryPrice = ctx.session.prefillEntryPrice;
+      }
+      if (ctx.session.prefillMarketCap) {
+        ctx.session.levMarketCap = ctx.session.prefillMarketCap;
+      }
+
+      const hasPrefill = ctx.session.prefillEntryPrice && ctx.session.prefillMarketCap;
+      if (hasPrefill) {
+        ctx.session.step = 'awaiting_lev_mode';
+        const msg = await ctx.reply(
+          `✅ *Account:* ${acct.label}\n` +
+          `📋 Auto-filled: *${acct.leverage}x* | *$${acct.capitalMax}* amount | *$${acct.balance}* balance\n` +
+          `📋 Pre-filled entry & MC from token\n\nNow choose *Leverage Mode*:`,
+          { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+            [Markup.button.callback('🔒 Isolated', 'lev_mode:isolated'), Markup.button.callback('🔗 Cross', 'lev_mode:cross')]
+          ]) }
+        );
+        ctx.session.lastLevQuestionId = msg.message_id;
+      } else {
+        ctx.session.step = 'awaiting_lev_entry_price';
+        const msg = await ctx.reply(
+          `✅ *Account:* ${acct.label}\n` +
+          `📋 Auto-filled: *${acct.leverage}x* | *$${acct.capitalMax}* amount | *$${acct.balance}* balance\n\nNow enter the *Entry Price* (e.g. 0.0001):`,
+          { parse_mode: 'Markdown' }
+        );
+        ctx.session.lastLevQuestionId = msg.message_id;
+      }
       return;
     }
 
@@ -1370,10 +1551,34 @@ export const setupBot = (token) => {
       const mode = data.split(':')[1]; // 'isolated' or 'cross'
       ctx.session.levMode = mode;
       ctx.answerCbQuery(`Mode: ${mode}`);
-      ctx.session.step = 'awaiting_lev_direction';
       // Delete the mode-selection keyboard message
       ctx.deleteMessage().catch(() => {});
-      const msg = await ctx.reply(`✅ Mode: *${mode.toUpperCase()}*\n\nNow enter *Direction* — reply "long" or "short":`, { parse_mode: 'Markdown' });
+      const msg = await ctx.reply(`✅ Mode: *${mode.toUpperCase()}*\n\nNow choose *Direction*:`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('📈 Long', 'lev_direction:long'), Markup.button.callback('📉 Short', 'lev_direction:short')]
+        ])
+      });
+      ctx.session.lastLevQuestionId = msg.message_id;
+      return;
+    }
+
+    if (data.startsWith('lev_direction:')) {
+      const dir = data.split(':')[1]; // 'long' or 'short'
+      ctx.session.levDirection = dir;
+      ctx.session.step = 'awaiting_lev_context';
+      ctx.answerCbQuery(`Direction: ${dir.toUpperCase()}`);
+      ctx.deleteMessage().catch(() => {});
+      const msg = await ctx.reply(
+        `✅ Direction: *${dir.toUpperCase()}*\n\n` +
+        `Now enter *Trade Setup Context* (optional) — describe your observations in one message:\n\n` +
+        `• Token niche / category\n` +
+        `• Candlestick sweep of lows/highs (if any)\n` +
+        `• Current funding fee rate (if known)\n` +
+        `• Retracement entry setup (FVG close, wick touch, etc.)\n\n` +
+        `Or type *"skip"* to skip:`,
+        { parse_mode: 'Markdown' }
+      );
       ctx.session.lastLevQuestionId = msg.message_id;
       return;
     }
@@ -1382,63 +1587,86 @@ export const setupBot = (token) => {
       const model = data.split(':')[1]; // 'deepseek' or 'grok'
       ctx.answerCbQuery(`Using ${model === 'grok' ? 'Grok 4.1 Fast' : 'DeepSeek Chat'}...`);
 
-      // Don't delete the model selection message — keep it so user can retry with other model
-      // Just show a loading message
-      const loadingMsg = await ctx.reply(`🧠 *Calculating leverage grid DCA strategy via ${model === 'grok' ? 'Grok 4.1 Fast' : 'DeepSeek Chat'}...*`, { parse_mode: 'Markdown' });
+      let loadingMsg;
+      try {
+        if (!ctx.session) {
+          ctx.reply('❌ Session expired. Please start again with /leverage or use the ⚖️ Lev Strategy button on a token.');
+          return;
+        }
 
-      const {
-        leverage, levAmount, levEntryPrice, levMarketCap,
-        levAccountBalance, levMode, levDirection, levContext
-      } = ctx.session;
+        // Don't delete the model selection message — keep it so user can retry with other model
+        // Just show a loading message
+        loadingMsg = await ctx.reply(`🧠 *Calculating leverage grid DCA strategy via ${model === 'grok' ? 'Grok 4.1 Fast' : 'DeepSeek Chat'}...*`, { parse_mode: 'Markdown' });
 
-      const params = {
-        leverage,
-        amount: levAmount,
-        entryPrice: levEntryPrice,
-        marketCap: levMarketCap,
-        accountBalance: levAccountBalance,
-        leverageMode: levMode,
-        gridOrders: 5,
-        direction: levDirection || 'long',
-        tokenContext: levContext || ''
-      };
+        const {
+          leverage, levAmount, levEntryPrice, levMarketCap,
+          levAccountBalance, levMode, levDirection, levContext, levAccountLabel
+        } = ctx.session;
 
-      const response = model === 'grok'
-        ? await getGrokStrategy(params)
-        : await getLeverageStrategy(params);
+        const accountTypeLabel = levAccountLabel || '';
+        const dayOfWeek = getDayOfWeek();
+        const hourOfDay = getHourOfDay();
 
-      // Clean up loading message
-      ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+        const params = {
+          leverage,
+          amount: levAmount,
+          entryPrice: levEntryPrice,
+          marketCap: levMarketCap,
+          accountBalance: levAccountBalance,
+          leverageMode: levMode,
+          gridOrders: 5,
+          direction: levDirection || 'long',
+          tokenContext: levContext || '',
+          accountType: accountTypeLabel,
+          dayOfWeek,
+          hourOfDay
+        };
 
-      if (!response.success) {
-        // Don't clear session — let user retry with other model
-        ctx.reply(`❌ ${model === 'grok' ? 'Grok' : 'DeepSeek'} Error: ${response.error}\n\nTry the other model or check your API key.`);
-        return;
+        const response = model === 'grok'
+          ? await getGrokStrategy(params)
+          : await getLeverageStrategy(params);
+
+        // Clean up loading message
+        ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+
+        if (!response.success) {
+          // Don't clear session — let user retry with other model
+          ctx.reply(`❌ ${model === 'grok' ? 'Grok' : 'DeepSeek'} Error: ${response.error}\n\nTry the other model or check your API key.`);
+          return;
+        }
+
+        // Success! Delete the model selection message and clear session
+        if (ctx.session.levModelMsgId) {
+          ctx.telegram.deleteMessage(ctx.chat.id, ctx.session.levModelMsgId).catch(() => {});
+        }
+
+        const modelLabel = response.model || (model === 'grok' ? 'grok-4.1-fast' : 'deepseek-chat');
+        const triggerMsgId = ctx.session.levTriggerMsgId;
+
+        const header = `<b>⚖️ LEVERAGE GRID DCA STRATEGY</b>\n` +
+          `<b>━━━━━━━━━━━━━━━━━━</b>\n` +
+          `<b>Inputs:</b> ${leverage}x ${(levDirection || 'long').toUpperCase()} | $${levAmount} | Entry $${levEntryPrice} | MC $${levMarketCap?.toLocaleString() || '?'} | ${levMode?.toUpperCase()}\n` +
+          (accountTypeLabel ? `<b>Account:</b> ${accountTypeLabel}\n` : '') +
+          `<b>Day:</b> ${dayOfWeek} | <b>Time:</b> ${hourOfDay}\n` +
+          `<b>Model:</b> ${modelLabel}\n` +
+          `<b>━━━━━━━━━━━━━━━━━━</b>\n\n` +
+          response.result;
+
+        ctx.session = null;
+
+        const replyParams = { parse_mode: 'HTML' };
+        if (triggerMsgId) {
+          replyParams.reply_to_message_id = triggerMsgId;
+        }
+        ctx.replyWithHTML(header, replyParams);
+      } catch (err) {
+        // Any unexpected error — clean up and show user
+        if (loadingMsg) {
+          ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+        }
+        ctx.reply(`❌ Unexpected error: ${err.message}\n\nPlease try again or switch models.`);
+        console.error('Model callback error:', err);
       }
-
-      // Success! Delete the model selection message and clear session
-      if (ctx.session.levModelMsgId) {
-        ctx.telegram.deleteMessage(ctx.chat.id, ctx.session.levModelMsgId).catch(() => {});
-      }
-
-      const formattedOutput = formatLeverageOutput(response.result);
-      const modelLabel = response.model || (model === 'grok' ? 'grok-4.1-fast' : 'deepseek-chat');
-      const triggerMsgId = ctx.session.levTriggerMsgId;
-
-      const header = `<b>⚖️ LEVERAGE GRID DCA STRATEGY</b>\n` +
-        `<b>━━━━━━━━━━━━━━━━━━</b>\n` +
-        `<b>Inputs:</b> ${leverage}x ${(levDirection || 'long').toUpperCase()} | $${levAmount} | Entry $${levEntryPrice} | MC $${levMarketCap.toLocaleString()} | ${levMode?.toUpperCase()}\n` +
-        `<b>Model:</b> ${modelLabel}\n` +
-        `<b>━━━━━━━━━━━━━━━━━━</b>\n\n` +
-        formattedOutput;
-
-      ctx.session = null;
-
-      const replyParams = { parse_mode: 'HTML' };
-      if (triggerMsgId) {
-        replyParams.reply_to_message_id = triggerMsgId;
-      }
-      ctx.replyWithHTML(header, replyParams);
       return;
     }
 

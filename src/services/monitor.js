@@ -2,6 +2,7 @@ import { Alert } from '../models/Alert.js';
 import { Stats } from '../models/Stats.js';
 import { Token } from '../models/Token.js';
 import { fetchTokenData } from './dexScreener.js';
+import { getFundingRate, formatFundingLine, interpretFunding } from './fundingRate.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -9,6 +10,27 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const WAVE1_TP_MIN = 10;      // 10% minimum TP from trough
 const WAVE1_TP_MAX = 30;      // 30% maximum TP (beyond this = overshoot warning)
 const WAVE1_TP_DEFAULT = 20;  // Default TP suggestion (20%)
+
+/**
+ * Fetches funding rate for a token and builds the alert message section.
+ * Returns '' when no perp market exists or the lookup fails — never throws.
+ */
+const buildFundingSection = async (token, direction) => {
+  try {
+    const funding = await getFundingRate(token.symbol);
+    if (!funding) return '';
+    token.lastFundingFetchAt = new Date();
+    const cacheKey = `${funding.symbol}@${funding.exchange}`;
+    if (!token.fundingSymbols.includes(cacheKey)) {
+      token.fundingSymbols.push(cacheKey);
+    }
+    const line = formatFundingLine(funding);
+    const hint = interpretFunding(funding, direction);
+    return `\n${line}${hint ? `\n${hint}` : ''}\n`;
+  } catch (err) {
+    return '';
+  }
+};
 
 /**
  * Generates a sentiment bar and summary stats for a token.
@@ -88,11 +110,21 @@ export const runMonitor = async (bot) => {
       // Skip if it's the first time we fetch data (prev values are 0)
       if (token.lastMarketCap === 0 && token.lastVolumeM5 === 0 && token.lastVolumeH1 === 0) {
         token.lastMarketCap = currentMarketCap;
+        token.surgeBaselineMc = currentMarketCap;
         token.lastLiveMc = currentMarketCap; // Initialize live MC baseline
         token.lastVolumeM5 = currentM5;
         token.lastVolumeH1 = currentH1;
+        token.surgeBaselineVol = currentH1; // Use h1 for surge baseline
         await token.save();
         continue;
+      }
+
+      // Migration: initialize surgeBaseline for pre-existing tokens that don't have it
+      if (token.surgeBaselineMc === 0 && token.lastMarketCap > 0) {
+        token.surgeBaselineMc = token.lastMarketCap;
+      }
+      if (token.surgeBaselineVol === 0 && token.lastVolumeH1 > 0) {
+        token.surgeBaselineVol = token.lastVolumeH1;
       }
 
       // --- LIVE TRACKING LOGIC ---
@@ -127,7 +159,7 @@ export const runMonitor = async (bot) => {
           // Only proceed with alert if threshold is met
           if (token.liveConsecutiveCount >= (globalStats.liveConsecutiveThreshold || 2)) {
             const isBullish = type === 'bullish';
-            const statusEmoji = isBullish ? '📈 Bullish' : '📉 Bearish';
+            const statusEmoji = isBullish ? '🟢' : '🔴';
             const directionText = isBullish ? 'making progress' : 'falling';
             
             // Add to Alert DB for sentiment tracking
@@ -162,6 +194,7 @@ export const runMonitor = async (bot) => {
             const troughInfo = token.liveTroughMc > 0 ? `\n⤴️ *Recovery from Trough:* +${recovery.toFixed(2)}%` : '';
 
             const sentimentStats = await getSentimentInfo(token.tokenId, globalStats.sentimentWindowHours || 4);
+            const fundingSection = await buildFundingSection(token, type);
 
             const fullMessage = `${statusEmoji} *LIVE: ${data.symbol}* ${statusEmoji}\n\n` +
                                 `The token is *${directionText}*!\n` +
@@ -169,6 +202,7 @@ export const runMonitor = async (bot) => {
                                 `*Price:* $${data.priceUsd}\n\n` +
                                 `${peakInfo}${troughInfo}\n\n` +
                                 `${sentimentStats}\n\n` +
+                                `${fundingSection}` +
                                 `_Updated at: ${now.toLocaleTimeString()} | Streak: ${token.liveConsecutiveCount} ${type}_`;
 
             const keyboard = [
@@ -198,7 +232,7 @@ export const runMonitor = async (bot) => {
               }
 
               // Send Summary Ping (Notification) replying to the main message
-              const summaryText = `${statusEmoji} *${type.toUpperCase()}* update for *${data.symbol}* (+${liveMcChange.toFixed(1)}%)`;
+              const summaryText = `${statusEmoji} ${data.symbol} (${liveMcChange > 0 ? '+' : ''}${liveMcChange.toFixed(1)}%)`;
               await bot.telegram.sendMessage(token.userId, summaryText, {
                 parse_mode: 'Markdown',
                 reply_to_message_id: mainMsgId
@@ -232,6 +266,10 @@ export const runMonitor = async (bot) => {
           token.stagnationLowPrice = currentPrice;
           token.stagnationLowTime = now;
         }
+
+        // Push price to stagnationRange on every scan for trend analysis
+        token.stagnationRange.push(currentPrice);
+        if (token.stagnationRange.length > 50) token.stagnationRange = token.stagnationRange.slice(-50);
 
         // ---- Crash Detection: Dual MC + price confirmation ----
         const crashPct = globalStats.crashPercentThreshold || 40;
@@ -445,17 +483,51 @@ export const runMonitor = async (bot) => {
               if (timeSinceLow >= stagWindow) {
                 const pctFromLow = ((currentMarketCap - token.stagnationLowMc) / token.stagnationLowMc) * 100;
                 if (pctFromLow >= stagPct) {
+                  // Delta gate: only re-fire if % changed by at least 2% from last alert
+                  if (token.stagnationLastType === 'long' && token.stagnationLastPct != null) {
+                    const delta = Math.abs(pctFromLow - token.stagnationLastPct);
+                    if (delta < 2) continue;
+                  }
                   token.stagnationAlertedAt = now;
                   token.stagnationLastType = 'long';
+                  token.stagnationLastPct = pctFromLow;
+
+                  // Build range analysis from stagnationRange array
+                  const range = token.stagnationRange.filter(p => p > 0);
+                  const rangeMax = range.length > 0 ? Math.max(...range) : currentPrice;
+                  const pricesAboveLow = range.filter(p => p > token.stagnationLowPrice);
+                  const closestToLow = pricesAboveLow.length > 0 ? Math.min(...pricesAboveLow) : currentPrice;
+
+                  let higherLows = 0, lowerLows = 0;
+                  for (let i = 1; i < range.length; i++) {
+                    if (range[i] > range[i - 1]) higherLows++;
+                    else if (range[i] < range[i - 1]) lowerLows++;
+                  }
+
+                  let higherLowLine = '';
+                  if (range.length >= 2) {
+                    const prev = range[range.length - 2];
+                    if (currentPrice > prev) {
+                      higherLowLine = `📈 <b>Higher Low:</b> $${currentPrice} > $${prev} ✅\n`;
+                    } else {
+                      higherLowLine = `⚠️ <b>No Higher Low:</b> $${currentPrice} ≤ $${prev}\n`;
+                    }
+                  }
 
                   const hoursSince = Math.floor(timeSinceLow / 3600000);
+                  const fundingSection = await buildFundingSection(token, 'long');
                   const longMsg = `📈 <b>STAGNATION LONG SIGNAL: ${data.symbol}</b>\n` +
                     `<b>━━━━━━━━━━━━━━━━━━</b>\n` +
                     `⏰ ${hoursSince}hrs since last low\n` +
                     `📉 <b>Last Low:</b> $${token.stagnationLowMc.toLocaleString()} MC at $${token.stagnationLowPrice}\n` +
+                    `📍 <b>Closest to Last Low:</b> $${closestToLow}\n` +
+                    `📏 <b>Range:</b> $${token.stagnationLowPrice} — $${rangeMax}\n` +
+                    `🔺 <b>HIGHERlOWs:</b> ${higherLows}  |  🔻 <b>lowerlOWs:</b> ${lowerLows}\n` +
                     `📊 <b>Now:</b> $${currentMarketCap.toLocaleString()} MC (+${pctFromLow.toFixed(1)}% MC)\n` +
+                    `${higherLowLine}` +
                     `<b>━━━━━━━━━━━━━━━━━━</b>\n` +
-                    `💡 Price stabilizing above recent low — potential reversal`;
+                    `${fundingSection}` +
+                    `💡 Tight base forming — closest low near last low`;
 
                   console.log(`[Stagnation] ${tokenId}: LONG stagnation signal (+${pctFromLow.toFixed(1)}% from low, ${hoursSince}hrs)`);
                   bot.telegram.sendMessage(token.userId, longMsg, { parse_mode: 'HTML' }).catch(() => {});
@@ -469,16 +541,50 @@ export const runMonitor = async (bot) => {
               if (timeSinceHigh >= stagWindow) {
                 const pctFromHigh = ((currentMarketCap - token.stagnationHighMc) / token.stagnationHighMc) * 100;
                 if (pctFromHigh <= -stagPct) {
+                  // Delta gate: only re-fire if % changed by at least 2% from last alert
+                  if (token.stagnationLastType === 'short' && token.stagnationLastPct != null) {
+                    const delta = Math.abs(Math.abs(pctFromHigh) - Math.abs(token.stagnationLastPct));
+                    if (delta < 2) continue;
+                  }
                   token.stagnationAlertedAt = now;
                   token.stagnationLastType = 'short';
+                  token.stagnationLastPct = pctFromHigh;
+
+                  // Build range analysis from stagnationRange array
+                  const range = token.stagnationRange.filter(p => p > 0);
+                  const rangeMin = range.length > 0 ? Math.min(...range) : currentPrice;
+                  const pricesBelowHigh = range.filter(p => p < token.stagnationHighPrice);
+                  const closestToHigh = pricesBelowHigh.length > 0 ? Math.max(...pricesBelowHigh) : currentPrice;
+
+                  let higherHighs = 0, lowerHighs = 0;
+                  for (let i = 1; i < range.length; i++) {
+                    if (range[i] > range[i - 1]) higherHighs++;
+                    else if (range[i] < range[i - 1]) lowerHighs++;
+                  }
+
+                  let lowerHighLine = '';
+                  if (range.length >= 2) {
+                    const prev = range[range.length - 2];
+                    if (currentPrice < prev) {
+                      lowerHighLine = `📉 <b>Lower High:</b> $${currentPrice} < $${prev} ⚠️\n`;
+                    } else {
+                      lowerHighLine = `🔄 <b>Possible Reversal:</b> $${currentPrice} ≥ $${prev}\n`;
+                    }
+                  }
 
                   const hoursSince = Math.floor(timeSinceHigh / 3600000);
+                  const fundingSection = await buildFundingSection(token, 'short');
                   const shortMsg = `📉 <b>STAGNATION SHORT SIGNAL: ${data.symbol}</b>\n` +
                     `<b>━━━━━━━━━━━━━━━━━━</b>\n` +
                     `⏰ ${hoursSince}hrs since last high\n` +
                     `📈 <b>Last High:</b> $${token.stagnationHighMc.toLocaleString()} MC at $${token.stagnationHighPrice}\n` +
+                    `📍 <b>Closest to Last High:</b> $${closestToHigh}\n` +
+                    `📏 <b>Range:</b> $${rangeMin} — $${token.stagnationHighPrice}\n` +
+                    `🔺 <b>HIGHERHIGHs:</b> ${higherHighs}  |  🔻 <b>lOWERHIGHs:</b> ${lowerHighs}\n` +
                     `📊 <b>Now:</b> $${currentMarketCap.toLocaleString()} MC (${pctFromHigh.toFixed(1)}% MC)\n` +
+                    `${lowerHighLine}` +
                     `<b>━━━━━━━━━━━━━━━━━━</b>\n` +
+                    `${fundingSection}` +
                     `💡 Price fading from recent high — potential short opportunity`;
 
                   console.log(`[Stagnation] ${tokenId}: SHORT stagnation signal (${pctFromHigh.toFixed(1)}% from high, ${hoursSince}hrs)`);
@@ -490,41 +596,30 @@ export const runMonitor = async (bot) => {
         }
       }
 
-      // 1. Calculate Market Cap Change
+      // 1. Calculate Market Cap Change (from surge baseline, not last scan)
       let marketCapChange = 0;
-      if (token.lastMarketCap > 0) {
-        marketCapChange = ((currentMarketCap - token.lastMarketCap) / token.lastMarketCap) * 100;
+      if (token.surgeBaselineMc > 0) {
+        marketCapChange = ((currentMarketCap - token.surgeBaselineMc) / token.surgeBaselineMc) * 100;
       }
 
-      // 2. Calculate Volume Change
-      let m5Change = 0;
-      if (token.lastVolumeM5 > 0) {
-        m5Change = ((currentM5 - token.lastVolumeM5) / token.lastVolumeM5) * 100;
-      }
-
+      // 2. Calculate Volume Change — use h1 as primary (smoother), m5 as secondary fallback
       let h1Change = 0;
-      if (token.lastVolumeH1 > 0) {
-        h1Change = ((currentH1 - token.lastVolumeH1) / token.lastVolumeH1) * 100;
+      if (token.surgeBaselineVol > 0) {
+        h1Change = ((currentH1 - token.surgeBaselineVol) / token.surgeBaselineVol) * 100;
       }
 
-      let volumeChange = 0;
-      let triggerSource = 'm5';
+      let volumeChange = h1Change;
+      let triggerSource = 'h1';
 
-      if (token.lastVolumeM5 === 0) {
-        volumeChange = h1Change;
-        triggerSource = 'h1';
-      } else {
-        if (m5Change >= h1Change) {
-          volumeChange = m5Change;
-          triggerSource = 'm5';
-        } else {
-          volumeChange = h1Change;
-          triggerSource = 'h1';
-        }
+      // Only use m5 if h1 baseline is not set yet
+      if (token.surgeBaselineVol === 0 && token.lastVolumeM5 > 0) {
+        volumeChange = ((currentM5 - token.lastVolumeM5) / token.lastVolumeM5) * 100;
+        triggerSource = 'm5';
       }
 
-      // 3. Check Cooldown
-      const onCooldown = token.lastAlertAt && (now - new Date(token.lastAlertAt) < token.cooldownMs);
+      // 3. Check Cooldown — use per-token value, fall back to global, then 3-min default
+      const effectiveCooldownMs = token.cooldownMs || globalStats.globalCooldownMs || 180000;
+      const onCooldown = token.lastAlertAt && (now - new Date(token.lastAlertAt) < effectiveCooldownMs);
 
       // 4. Evaluate Alert Conditions
       const marketCapTriggered = marketCapChange >= token.marketCapThreshold;
@@ -563,13 +658,16 @@ export const runMonitor = async (bot) => {
         await alert.save();
 
         // Send Telegram Alert
+        const fundingSection = await buildFundingSection(token, marketCapChange >= 0 ? 'bullish' : 'bearish');
+
         const message = `🚨 *SURGE ALERT: ${data.symbol}* 🚨\n\n` +
                         `*Chain:* ${token.chain.toUpperCase()}\n` +
                         `*Price:* $${data.priceUsd}\n\n` +
                         `📈 *Market Cap:* +${marketCapChange.toFixed(2)}%\n` +
                         `🔊 *Volume Spike:* +${volumeChange.toFixed(2)}% (${triggerSource})\n\n` +
                         `💰 *Current MC:* $${currentMarketCap.toLocaleString()}\n` +
-                        `📊 *Current Vol (1h):* $${currentH1.toLocaleString()}\n`;
+                        `📊 *Current Vol (1h):* $${currentH1.toLocaleString()}\n` +
+                        `${fundingSection}`;
         
         const keyboard = [
           [{ text: '📈 View on DexScreener', url: data.dexUrl || `https://dexscreener.com/${token.chain}/${token.tokenAddress}` }],
@@ -582,11 +680,13 @@ export const runMonitor = async (bot) => {
           reply_markup: { inline_keyboard: keyboard }
         });
 
-        // Update lastAlertAt
+        // Update lastAlertAt and surge baselines (only moves on alert)
         token.lastAlertAt = now;
+        token.surgeBaselineMc = currentMarketCap;
+        token.surgeBaselineVol = currentH1; // Use h1 as the volume baseline
       }
 
-      // 5. Update last values regardless of alert
+      // 5. Update last values regardless of alert (for display, live tracking, stagnation)
       token.lastMarketCap = currentMarketCap;
       token.lastVolumeM5 = currentM5;
       token.lastVolumeH1 = currentH1;

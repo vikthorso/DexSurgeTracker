@@ -10,7 +10,9 @@ const CHAIN_ID_MAP = {
   ethereum: '0x1',
   bsc: '0x38',
   base: '0x2105',
-  solana: null  // explicitly unsupported
+  solana: null,  // explicitly unsupported
+  hyperliquid: null,  // Hyperliquid L1 — not EVM
+  sui: null  // Sui L1 — not EVM
 };
 
 /**

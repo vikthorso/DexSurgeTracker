@@ -4,10 +4,9 @@ import OpenAI from 'openai';
  * Grok Research Service — powers 3 research features:
  * 1. FUD check on X/Twitter (social sentiment analysis)
  * 2. Upcoming token unlock research
- * 3. Investor & backer research
+ * 3. Investor backers & market maker research (fixed watch-list check)
  *
- * Reuses the existing xAI Grok API via OpenAI-compatible endpoint.
- * Uses grok-4-1-fast model with web search capability for real-time data.
+ * Uses the xAI Responses API with the web_search tool for real-time grounding.
  */
 
 const GROK_API_URL = 'https://api.x.ai/v1';
@@ -31,23 +30,30 @@ const callGrokResearch = async (userPrompt) => {
   }
 
   try {
-    const response = await client.chat.completions.create({
-      model: 'grok-4-1-fast-reasoning',
-      messages: [
+    const response = await client.responses.create({
+      model: 'grok-4.6',
+      input: [
         { role: 'system', content: RESEARCH_SYSTEM_PROMPT },
         { role: 'user', content: userPrompt }
       ],
-      temperature: 0.3,
-      max_tokens: 2000,
-      stream: false
+      tools: [{ type: 'web_search' }],
+      max_output_tokens: 3000,
+      store: false
     });
 
-    const result = response.choices?.[0]?.message?.content;
+    const result = (response.output || [])
+      .filter((item) => item.type === 'message')
+      .flatMap((item) => (item.content || []))
+      .filter((c) => c.type === 'output_text')
+      .map((c) => c.text)
+      .join('')
+      .trim();
+
     if (!result) {
       return { success: false, error: 'Empty response from Grok API.' };
     }
 
-    return { success: true, result };
+    return { success: true, result, model: 'grok-4.6' };
   } catch (error) {
     console.error('[GrokResearch] API error:', error.message);
     return { success: false, error: 'Grok API error: ' + error.message };
@@ -153,64 +159,50 @@ export const checkUpcomingUnlocks = async (tokenName, tokenSymbol, chain, tokenA
 };
 
 // ============================================================================
-// FEATURE 3: Investor & Backer Research
+// FEATURE 3: Investor Backers & Market Makers (Fixed Watch-List Check)
 // ============================================================================
 
-export const researchInvestors = async (tokenName, tokenSymbol, chain, marketCap, customPrompt = '') => {
-  const defaultPrompt = 'Research the investors, backers, and funding history for the project below. Search Crunchbase, CryptoRank, Cryptorank, RootData, official announcements, and VC portfolio pages.\n' +
+export const researchInvestorsMM = async (tokenName, tokenSymbol, tokenAddress, chain = '') => {
+  const chainLine = chain ? `\n- Chain: ${chain.toUpperCase()}` : '';
+  const prompt = 'Token research request. Inputs:\n' +
+    '- Name: ' + tokenName + '\n' +
+    '- Symbol: ' + tokenSymbol + '\n' +
+    '- Contract: ' + tokenAddress + chainLine + '\n' +
     '\n' +
-    'PROJECT: ' + tokenName + ' ($' + tokenSymbol + ')\n' +
-    'CHAIN: ' + chain.toUpperCase() + '\n' +
-    'CURRENT MARKET CAP: $' + ((marketCap || 0).toLocaleString()) + '\n' +
+    'Check ONLY against this fixed list:\n' +
     '\n' +
-    'Search for and report on:\n' +
-    '1. All known funding rounds \u2014 seed, private, strategic, Series A/B, IDO/IEO, etc. Include dates, amounts, and valuations\n' +
-    '2. Notable VC funds and institutional investors \u2014 who led, who participated\n' +
-    '3. Angel investors and prominent individual backers\n' +
-    '4. Exchange/market maker relationships \u2014 which exchanges are investors?\n' +
-    '5. Total raised across all rounds\n' +
-    '6. Investor track record \u2014 have these VCs backed winners before?\n' +
-    '7. Any red flags \u2014 VC dumping, unfavorable token terms for retail, misaligned incentives\n' +
+    'Backers:\n' +
+    'YZi Labs (formerly Binance Labs), TRON DAO (TRON Foundation), HTX Ventures (formerly Huobi Ventures), HashKey Capital, Symbolic Capital / Symbolic VC, KR1, Continue Capital, Vessel Capital, DECOM (Switzerland AG), DWF Labs, Mucker Capital, Gate Labs, Selini Capital\n' +
     '\n' +
-    'Output in this EXACT format:\n' +
+    'Market Makers:\n' +
+    'GSR, DWF Labs, Wintermute, Jump Crypto / Jump Trading, Jane Street, B2C2, Flow Traders, Cumberland (DRW), Amber Group, Kairon Labs, Galaxy Digital, FalconX\n' +
     '\n' +
-    '[FUNDING SUMMARY]:\n' +
-    'Total Raised: {amount} across {N} rounds\n' +
-    'Valuation at Last Round: {amount if known}\n' +
+    'Output rules (strict):\n' +
+    '- Extremely brief and compact. No fluff.\n' +
+    '- Use this exact structure:\n' +
     '\n' +
-    '[FUNDING ROUNDS]:\n' +
-    '\u2022 {Round Type} ({date}): {amount} at {valuation} \u2014 Led by {lead investor}\n' +
-    '\u2022 {Round Type} ({date}): {amount} \u2014 {key participants}\n' +
-    '...(list all found)\n' +
+    '**[SYMBOL] – [NAME]**\n' +
+    'Contract: [ADDRESS]\n' +
     '\n' +
-    '[NOTABLE INVESTORS]:\n' +
-    '\u2022 {Investor Name} \u2014 {type}: {role/round}, {brief note on track record}\n' +
-    '\u2022 {Investor Name} \u2014 {type}: {role/round}\n' +
-    '...(5-10 top investors)\n' +
+    '**Funding**\n' +
+    '- Total raised: $X\n' +
+    '- Rounds: [list key rounds with amounts/dates if available]\n' +
     '\n' +
-    '[EXCHANGE RELATIONS]:\n' +
-    '\u2022 {exchange name}: {relationship \u2014 investor/partner/listed}\n' +
-    '...(or \"None found / No public exchange investment\")\n' +
+    '**Backers (from list)**\n' +
+    '- Present: [names only]\n' +
+    '- Absent: all others (or “None from list”)\n' +
     '\n' +
-    '[INVESTOR QUALITY]: STRONG / MODERATE / WEAK / UNKNOWN\n' +
-    '(Based on VC tier, track record, and alignment)\n' +
+    '**Market Makers (from list)**\n' +
+    '- Confirmed / Linked: [names only]\n' +
+    '- None confirmed: [if applicable]\n' +
     '\n' +
-    '[RED FLAGS]:\n' +
-    '\u2022 {any concerns about investors, vesting, or token terms}\n' +
-    '...(or \"None identified\")\n' +
+    '**Other notable investments by the matched companies**\n' +
+    '- [Company]: [2–4 other tokens they backed, brief]\n' +
+    '(Only list for companies that matched on this token. Keep ultra-short.)\n' +
     '\n' +
-    '[NOTES]: 1-2 sentence verdict on backing quality and what it means for the token';
+    'If data is incomplete or not public, state “Not publicly disclosed” in one line. Prioritize official announcements, funding trackers (CryptoRank, RootData, PitchBook, etc.), and on-chain reports. Do not invent connections.';
 
-  const prompt = customPrompt || defaultPrompt;
-
-  const finalPrompt = customPrompt
-    ? prompt
-        .replace(/\{PROJECT\}/g, tokenName + ' ($' + tokenSymbol + ')')
-        .replace(/\{CHAIN\}/g, chain.toUpperCase())
-        .replace(/\{MARKET_CAP\}/g, (marketCap || 0).toLocaleString())
-    : prompt;
-
-  return callGrokResearch(finalPrompt);
+  return callGrokResearch(prompt);
 };
 
 // ============================================================================
@@ -266,21 +258,15 @@ export const formatUnlocksResult = (text, tokenSymbol) => {
   return header + formatted + footer;
 };
 
-export const formatInvestorsResult = (text, tokenSymbol) => {
+export const formatInvestorsMMResult = (text, tokenSymbol) => {
   if (!text) return '<b>No investor data found.</b>';
 
   let formatted = escapeForHTML(text);
 
-  formatted = formatted
-    .replace(/\[FUNDING SUMMARY\]/gi, '<b>[FUNDING SUMMARY]</b>')
-    .replace(/\[FUNDING ROUNDS\]/gi, '<b>[FUNDING ROUNDS]</b>')
-    .replace(/\[NOTABLE INVESTORS\]/gi, '<b>[NOTABLE INVESTORS]</b>')
-    .replace(/\[EXCHANGE RELATIONS\]/gi, '<b>[EXCHANGE RELATIONS]</b>')
-    .replace(/\[INVESTOR QUALITY\]/gi, '<b>[INVESTOR QUALITY]</b>')
-    .replace(/\[RED FLAGS\]/gi, '<b>[RED FLAGS]</b>')
-    .replace(/\[NOTES\]/gi, '<b>[NOTES]</b>');
+  // Convert **bold** markdown markers to <b> tags for Telegram HTML rendering
+  formatted = formatted.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
 
-  const header = '<b>\u{1F4B0} INVESTORS & BACKERS: ' + tokenSymbol + '</b>\n' +
+  const header = '<b>\u{1F4B0} INVESTOR BACKERS: ' + tokenSymbol + '</b>\n' +
     '<b>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</b>\n\n';
   const footer = '\n\n<b>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</b>\n' +
     '<b>Source:</b> Grok 4.1 Research | <i>Verify independently</i>';

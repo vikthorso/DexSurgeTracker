@@ -1,20 +1,6 @@
 import OpenAI from 'openai';
-import { SYSTEM_TEMPLATE, buildUserMessage } from './levTemplate.js';
+import { getSystemTemplate, buildUserMessage } from './levTemplate.js';
 
-/**
- * Calls DeepSeek API (OpenAI-compatible) with the leverage grid trading prompt.
- * @param {Object} params
- * @param {number} params.leverage - e.g. 5
- * @param {number} params.amount - Trade amount in USD e.g. 100
- * @param {number} params.entryPrice - Entry price
- * @param {number} params.marketCap - Current market cap
- * @param {number} params.accountBalance - Current account balance
- * @param {string} params.leverageMode - 'cross' or 'isolated'
- * @param {number} [params.gridOrders=5] - Number of grid orders
- * @param {string} [params.direction='long'] - 'long' or 'short'
- * @param {string} [params.tokenContext=''] - Optional token category/niche context
- * @returns {Promise<{success: boolean, result?: string, error?: string, model?: string}>}
- */
 export const getLeverageStrategy = async (params) => {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey || apiKey === 'your_deepseek_api_key_here') {
@@ -26,13 +12,16 @@ export const getLeverageStrategy = async (params) => {
     baseURL: 'https://api.deepseek.com'
   });
 
-  const userMessage = buildUserMessage(params);
-
   try {
+    const [systemTemplate, userMessage] = await Promise.all([
+      getSystemTemplate(),
+      Promise.resolve(buildUserMessage(params))
+    ]);
+
     const response = await client.chat.completions.create({
       model: 'deepseek-chat',
       messages: [
-        { role: 'system', content: SYSTEM_TEMPLATE },
+        { role: 'system', content: systemTemplate },
         { role: 'user', content: userMessage }
       ],
       temperature: 0.3,
